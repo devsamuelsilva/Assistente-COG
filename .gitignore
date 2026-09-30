@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+scripts/cloudflared.yml
+*.log
+.DS_Store
+acervo/*
+!acervo/exemplo-normativo.md
+web/node_modules/
+web/dist/

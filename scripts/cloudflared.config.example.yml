@@ -1,0 +1,9 @@
+# Copie este arquivo para scripts/cloudflared.yml e preencha.
+# O arquivo preenchido fica de fora do git.
+tunnel: SUBSTITUA_PELO_ID_DO_TUNEL
+credentials-file: C:\Users\SEU_USUARIO\.cloudflared\SUBSTITUA_PELO_ID_DO_TUNEL.json
+
+ingress:
+  - hostname: assistente-cog.seudominio.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404
