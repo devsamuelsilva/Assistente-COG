@@ -234,9 +234,9 @@ _SISTEMA = _SISTEMA_V2 if PROMPT_VERSAO == "v2" else _SISTEMA_V1
 
 _PLANO = """Você prepara a pergunta de um operador para uma busca em normativos operacionais (ITOM, NO e similares).
 Receba a conversa anterior (pode não haver) e a pergunta atual. Responda só com JSON:
-{"pergunta": "...", "tipo": "geral" ou "especifica", "consultas": ["...", "..."]}
+{"pergunta": "...", "tipo": "catalogo", "geral" ou "especifica", "consultas": ["...", "..."]}
 - "pergunta": a pergunta atual completa e independente, que se entenda sem a conversa (resolva "ela", "isso", complementos curtos como "e de urgência"). Se já for completa, repita-a. Mantenha siglas, números e nomes.
-- "tipo": "geral" quando a pergunta é sobre o documento como um todo (finalidade, objetivo, escopo, assunto, resumo, a quem se aplica, o que ele diz). "especifica" nos demais casos (valor, prazo, passo, responsável, definição de um termo).
+- "tipo": "catalogo" quando a pergunta é sobre a própria base de consulta: quais documentos, normativos ou ITOMs existem ou estão disponíveis, quantos são, qual a revisão ou a vigência de um documento. "geral" quando a pergunta é sobre o documento como um todo (finalidade, objetivo, escopo, assunto, resumo, a quem se aplica, o que ele diz). "especifica" nos demais casos (valor, prazo, passo, responsável, definição de um termo).
 - "consultas": de 1 a 3 reformulações curtas da pergunta com o vocabulário que um normativo usaria: sinônimos, sigla por extenso, o título provável da seção (por exemplo: finalidade -> objetivo; quem pode -> responsabilidades; quando se aplica -> escopo). Não responda a pergunta e não invente valor, prazo ou fato."""
 
 
@@ -251,6 +251,13 @@ _REFERENCIA = r"\[\d+\](?:\s*(?:a|e|,|–|-)\s*\[\d+\])*"
 _ARTIGO_TRECHO = re.compile(rf"(?i)\b(o|os|no|nos|do|dos|ao|aos|pelo|pelos)\s+trechos?\s+{_REFERENCIA}")
 _TRECHO_SOLTO = re.compile(rf"(?i)\btrechos?\s+{_REFERENCIA}")
 _CONTRACAO = {"o": "o", "os": "o", "no": "no", "nos": "no", "do": "do", "dos": "do", "ao": "ao", "aos": "ao", "pelo": "pelo", "pelos": "pelo"}
+# Pergunta sobre a base de consulta, e não sobre o conteúdo de um normativo. É a reserva do tipo "catalogo" do planejador.
+_CATALOGO = re.compile(
+    r"(?i)(?:\b(?:list\w*|mostr\w*|exib\w*|quais|quantos|quantas)\b[^.?!]{0,50}\b(?:documentos?|normativos?|itoms?|instru[cç][oõ]es|"
+    r"arquivos|procedimentos)\b[^.?!]{0,60}\b(?:dispon[ií]ve\w*|consult\w*|base|acervo|cadastrad\w*|indexad\w*|possu\w*|conhece\w*)\b)"
+    r"|(?:\b(?:list\w*|lista|quero|mostr\w*|exib\w*|quais)\b[^.?!]{0,40}\b(?:base de dados|acervo|base de consulta)\b)"
+    r"|(?:\bo ?que\s+(?:voc[eê]\s+|eu\s+|posso\s+)?(?:tem|sabe|consegue|posso|pode)\s+(?:consultar|responder)\b)"
+)
 _NUMERO = re.compile(r"\d+(?:[.,]\d+)*")
 _MARCADOR_LISTA = re.compile(r"(?m)^\s*\d{1,2}[.)]\s")
 _STATUS = ("coberto", "parcial", "ausente")
@@ -322,6 +329,11 @@ def responder(
     plano = _planejar(data_dir, pergunta, turnos, reescritor, uso_aux) if reescritor else {}
     # Só há "pergunta reescrita" quando a conversa anterior pesa: sozinha, a pergunta original é a que se busca.
     reescrita = plano.get("pergunta", "") if turnos else ""
+    if plano.get("tipo") == "catalogo" or _CATALOGO.search(reescrita or pergunta):
+        resultado = _responder_catalogo(pergunta, indice, reescrita or pergunta, uso_aux, desatualizado)
+        resultado.duracao_ms = _ms(inicio)
+        _registrar(data_dir, resultado, autor, origem, bool(turnos))
+        return resultado
     inicio_busca = time.perf_counter()
     acertos, arquivos = buscar_contexto(indice, pergunta, turnos, embedder, reordenador, modo, reescrita, plano)
     ms_busca = _ms(inicio_busca)
@@ -411,6 +423,69 @@ def buscar_contexto(
     if arquivos and (plano.get("tipo") == "geral" or _GERAL.search(reescrita or pergunta)):
         acertos = _com_abertura(vigentes, acertos, arquivos)
     return acertos, arquivos
+
+
+def _documentos_do_indice(indice: Indice) -> dict[str, dict]:
+    documentos: dict[str, dict] = {}
+    for trecho in indice.trechos:
+        atual = documentos.setdefault(
+            trecho.arquivo,
+            {
+                "codigo": codigo_limpo(trecho.codigo) or trecho.arquivo,
+                "revisao": trecho.revisao,
+                "titulo": " ".join(trecho.titulo.split()),
+                "vigente": trecho.vigente,
+                "secoes": set(),
+            },
+        )
+        secao = secao_base(trecho.secao)
+        if not (secao.startswith("Sumário") or secao in ("Documento", SECAO_VISAO_GERAL)):
+            atual["secoes"].add(secao)
+    return documentos
+
+
+def _sem_revisao(texto: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"(?i)\s*rev\.?\s*\d+.*$", "", texto).casefold())
+
+
+def _linha_documento(doc: dict) -> str:
+    codigo, titulo = doc["codigo"], doc["titulo"]
+    # O código já traz a revisão ("ITOM EGP 01 Rev.02"): repeti-la ou repetir o código como título só polui a lista.
+    revisao = f" (revisão {doc['revisao']})" if doc["revisao"] and not re.search(r"(?i)\brev\.?\s*\d", codigo) else ""
+    repete = not titulo or _sem_revisao(titulo) == _sem_revisao(codigo) or titulo.casefold() == f"{codigo}.pdf".casefold()
+    descricao = "" if repete else f": {titulo}"
+    secoes = f" · {len(doc['secoes'])} seções" if doc["secoes"] else ""
+    return f"- {codigo}{revisao}{descricao}{secoes}"
+
+
+def _responder_catalogo(pergunta: str, indice: Indice, texto: str, uso: list[int], desatualizado: bool) -> Resultado:
+    """Pergunta sobre a própria base ("quais documentos existem?"): a resposta vem do índice, exata e sem GPT.
+
+    A busca por texto só acharia trechos que mencionam outros documentos, e o assistente responderia com exemplos soltos."""
+    todos = _documentos_do_indice(indice)
+    citados, _ = escopo(texto, indice.trechos)
+    escolhidos = {arquivo: doc for arquivo, doc in todos.items() if not citados or arquivo in citados}
+    vigentes = sorted((doc for doc in escolhidos.values() if doc["vigente"]), key=lambda doc: doc["codigo"].casefold())
+    fora = sorted((doc for doc in escolhidos.values() if not doc["vigente"]), key=lambda doc: doc["codigo"].casefold())
+    if not vigentes and not fora:
+        texto_resposta = "Não há documentos no acervo indexado."
+    else:
+        cabecalho = "Documentos disponíveis para consulta" if not citados else "Dados do documento"
+        partes = [f"{cabecalho} ({len(vigentes)}):\n" + "\n".join(_linha_documento(doc) for doc in vigentes)] if vigentes else []
+        if fora:
+            partes.append("Fora de vigência (não entram nas respostas):\n" + "\n".join(_linha_documento(doc) for doc in fora))
+        texto_resposta = "\n\n".join(partes)
+    resultado = Resultado(
+        pergunta=pergunta,
+        resposta=texto_resposta,
+        coberto=True,
+        citacoes=[],
+        desatualizado=desatualizado,
+        status="catalogo",
+    )
+    resultado.tokens_aux_prompt, resultado.tokens_aux_resposta = uso
+    resultado.modelo_aux = AUX_MODEL if any(uso) else ""
+    return resultado
 
 
 def _com_consultas(indice: Indice, acertos: list[Acerto], consultas: list[str], embedder, arquivos: set[str]) -> list[Acerto]:
@@ -540,6 +615,8 @@ def formatar(resultado: Resultado, autor: str | None = None) -> str:
         if resultado.desatualizado
         else ""
     )
+    if resultado.status == "catalogo":
+        return f"{cabecalho}{resultado.resposta}\n\nLista montada a partir do acervo indexado.{aviso_indice}\n\n{AVISO_OPERADOR}"
     if not resultado.coberto or not resultado.citacoes:
         nucleo = resultado.resposta or "Esse ponto não está no normativo indexado neste PC."
         return f"{cabecalho}{nucleo}\n\nSiga o fluxo humano do COG.{aviso_indice}\n\n{AVISO_OPERADOR}"
@@ -611,6 +688,11 @@ def reescrever_openai(mensagens: list[dict]) -> gpt.Saida:
     return gpt.json_simples(mensagens, AUX_MODEL)
 
 
+def _tipo_do_plano(valor) -> str:
+    tipo = str(valor or "").strip().casefold()
+    return tipo if tipo in {"geral", "catalogo"} else "especifica"
+
+
 def _planejar(data_dir, pergunta: str, turnos: list[tuple[str, str]], reescritor, uso: list[int]) -> dict:
     """O GPT barato entende a pergunta: completa a conversa, diz se é geral e a reformula com o vocabulário do normativo.
 
@@ -637,7 +719,7 @@ def _planejar(data_dir, pergunta: str, turnos: list[tuple[str, str]], reescritor
     consultas = [" ".join(str(item).split()) for item in dados.get("consultas") or [] if isinstance(item, str)]
     plano = {
         "pergunta": " ".join(str(dados.get("pergunta") or "").split()),
-        "tipo": "geral" if str(dados.get("tipo") or "").strip().casefold() == "geral" else "especifica",
+        "tipo": _tipo_do_plano(dados.get("tipo")),
         "consultas": [consulta for consulta in consultas if consulta][:3],
     }
     if plano["pergunta"]:
