@@ -2,20 +2,34 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from collections import deque
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from openai import OpenAIError
 from pydantic import BaseModel, Field
 
-from app import avaliacao
-from app.config import ACERVO_DIR, DATA_DIR, HOST, PORT, RAIZ, TEAMS_OUTGOING_HMAC_SECRET
-from app.indice import aquecer_modelo, caminho_indice, indexar
-from app.painel import consultar, estado_acervo, gravar_meta, remover_arquivo, salvar_envio
-from app.uso import ler_uso
+from app import avaliacao, treino, uso, visao
+from app.config import ACERVO_DIR, DATA_DIR, HOST, PORT, RAIZ, RERANKER_MODEL, TEAMS_OUTGOING_HMAC_SECRET
+from app.indice import aquecer_modelo, caminho_indice
+from app.ons import ErroOns, responder_ons
+from app.reranker import aquecer as aquecer_reranker
+from app.painel import (
+    LIMITE_BYTES,
+    consultar,
+    estado_acervo,
+    estado_indexacao,
+    gravar_meta,
+    iniciar_indexacao,
+    remover_arquivo,
+    salvar_envio,
+)
+from app.registro import registrar_retorno
 from app.teams import assinatura_valida, limpar_pergunta, processar_mencao
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -26,10 +40,24 @@ _ATIVIDADES: deque[str] = deque(maxlen=200)
 @asynccontextmanager
 async def _vida(app: FastAPI):
     try:
+        if uso.migrar_logs(DATA_DIR):
+            logging.info("Log de consultas enxugado. A cópia anterior ficou em data/logs/consultas.jsonl.bak.")
+    except OSError:
+        logging.exception("Não foi possível enxugar o log de consultas.")
+    threading.Thread(target=_aquecer_acervo, daemon=True).start()
+    try:
         aquecer_modelo()
+        aquecer_reranker(RERANKER_MODEL)
     except Exception:
-        logging.exception("Não foi possível carregar o modelo local de embeddings.")
+        logging.exception("Não foi possível carregar os modelos locais de embeddings e reordenação.")
     yield
+
+
+def _aquecer_acervo() -> None:
+    try:
+        estado_acervo()
+    except Exception:
+        logging.exception("Não foi possível analisar o acervo na subida.")
 
 
 app = FastAPI(title="Assistente do COG", lifespan=_vida)
@@ -39,6 +67,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.exception_handler(OpenAIError)
+async def _erro_openai(_request: Request, erro: OpenAIError) -> JSONResponse:
+    logging.warning("Falha na OpenAI: %s", erro)
+    if {getattr(erro, "code", None), getattr(erro, "type", None)} & {"insufficient_quota", "credit_balance_exhausted"}:
+        detalhe = (
+            "Os créditos da conta da OpenAI acabaram. Adicione créditos em platform.openai.com "
+            "(Settings > Billing) e pergunte de novo."
+        )
+    else:
+        detalhe = f"O GPT não respondeu ({erro.__class__.__name__}). Tente de novo em instantes."
+    return JSONResponse({"detail": detalhe}, status_code=502)
 
 
 class TurnoIn(BaseModel):
@@ -49,6 +91,24 @@ class TurnoIn(BaseModel):
 class PerguntaIn(BaseModel):
     pergunta: str = Field(min_length=1, max_length=4000)
     historico: list[TurnoIn] = Field(default_factory=list, max_length=8)
+
+
+class RodarIn(BaseModel):
+    modo: str | None = None
+    reranker: str | None = Field(default=None, max_length=200)
+
+
+class RevisaoIn(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    veredito: str
+    resposta_corrigida: str = Field(default="", max_length=4000)
+    observacao: str = Field(default="", max_length=1000)
+
+
+class RetornoIn(BaseModel):
+    consulta: str = Field(min_length=1, max_length=40)
+    util: bool
+    comentario: str = Field(default="", max_length=1000)
 
 
 class MetaIn(BaseModel):
@@ -63,19 +123,25 @@ class ArquivoIn(BaseModel):
     arquivo: str
 
 
+class RevisaoVisaoIn(BaseModel):
+    texto: str | None = None
+
+
 @app.get("/api/acervo")
 def api_acervo() -> dict:
     return estado_acervo()
 
 
 @app.post("/api/acervo")
-async def api_enviar(arquivo: UploadFile = File(...)) -> dict:
-    conteudo = await arquivo.read()
+def api_enviar(arquivo: UploadFile = File(...)) -> dict:
+    conteudo = arquivo.file.read(LIMITE_BYTES + 1)
     try:
-        salvar_envio(ACERVO_DIR, arquivo.filename or "", conteudo)
+        nome = salvar_envio(ACERVO_DIR, arquivo.filename or "", conteudo)
     except ValueError as erro:
         raise HTTPException(status_code=400, detail=str(erro)) from erro
-    return estado_acervo()
+    # Só guarda e analisa. A indexação e o treino começam quando o usuário confirma código, revisão e título
+    # (PUT /api/acervo/meta), para o documento entrar no índice já com o nome certo.
+    return {**estado_acervo(), "enviado": nome}
 
 
 @app.put("/api/acervo/meta")
@@ -86,6 +152,7 @@ def api_meta(corpo: MetaIn) -> dict:
         raise HTTPException(status_code=404, detail=str(erro)) from erro
     except ValueError as erro:
         raise HTTPException(status_code=400, detail=str(erro)) from erro
+    iniciar_indexacao()
     return estado_acervo()
 
 
@@ -97,21 +164,81 @@ def api_remover(corpo: ArquivoIn) -> dict:
         raise HTTPException(status_code=404, detail=str(erro)) from erro
     except ValueError as erro:
         raise HTTPException(status_code=400, detail=str(erro)) from erro
+    iniciar_indexacao()
     return estado_acervo()
+
+
+@app.get("/api/visao")
+def api_visao() -> list[dict]:
+    return visao.listar(DATA_DIR)
+
+
+@app.put("/api/visao/{hash_figura}")
+def api_revisar_visao(hash_figura: str, corpo: RevisaoVisaoIn) -> dict:
+    try:
+        return visao.revisar(DATA_DIR, hash_figura, corpo.texto)
+    except FileNotFoundError as erro:
+        raise HTTPException(status_code=404, detail=str(erro)) from erro
 
 
 @app.post("/api/indexar")
 def api_indexar() -> dict:
-    try:
-        indexar(ACERVO_DIR, DATA_DIR)
-    except (FileNotFoundError, ValueError) as erro:
-        raise HTTPException(status_code=400, detail=str(erro)) from erro
-    return estado_acervo()
+    return iniciar_indexacao()
+
+
+@app.get("/api/indexar")
+def api_indexacao() -> dict:
+    return estado_indexacao()
+
+
+@app.get("/api/treino")
+def api_treino() -> dict:
+    return {**treino.estado(DATA_DIR), "preparacao": estado_indexacao()}
+
+
+@app.post("/api/treino")
+def api_treinar(corpo: ArquivoIn) -> dict:
+    if corpo.arquivo not in {documento["arquivo"] for documento in estado_acervo()["documentos"]}:
+        raise HTTPException(status_code=404, detail="Arquivo não está no acervo.")
+    iniciar_indexacao(forcar={corpo.arquivo})
+    return {**treino.estado(DATA_DIR), "preparacao": estado_indexacao()}
 
 
 @app.get("/api/uso")
 def api_uso() -> dict:
-    return ler_uso(DATA_DIR)
+    return uso.ler_uso(DATA_DIR)
+
+
+@app.post("/api/uso/zerar")
+def api_uso_zerar() -> dict:
+    uso.zerar(DATA_DIR)
+    return uso.ler_uso(DATA_DIR)
+
+
+@app.delete("/api/uso/zerar")
+def api_uso_somar_tudo() -> dict:
+    uso.somar_tudo(DATA_DIR)
+    return uso.ler_uso(DATA_DIR)
+
+
+@app.get("/api/uso/perguntas")
+def api_uso_perguntas(canal: str = Query("operacional", pattern="^(operacional|ons)$")) -> dict:
+    return {"perguntas": uso.perguntas(DATA_DIR, canal)}
+
+
+@app.get("/api/uso/consultas")
+def api_uso_consultas(
+    limite: int = Query(10, ge=1, le=500),
+    busca: str = Query("", max_length=200),
+    nao_uteis: bool = False,
+    documento: str = Query("", max_length=200),
+) -> dict:
+    return uso.consultas(DATA_DIR, limite, busca, nao_uteis, documento)
+
+
+@app.get("/api/uso/ons")
+def api_uso_ons() -> dict:
+    return {"consultas": uso.medidas_ons(DATA_DIR)}
 
 
 @app.post("/api/chat")
@@ -119,9 +246,20 @@ def api_chat(corpo: PerguntaIn) -> dict:
     try:
         turnos = [{"pergunta": item.pergunta, "resposta": item.resposta} for item in corpo.historico]
         return consultar(corpo.pergunta, historico=turnos)
-    except FileNotFoundError as erro:
+    except (FileNotFoundError, ValueError) as erro:
         raise HTTPException(status_code=409, detail=str(erro)) from erro
     except RuntimeError as erro:
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+
+
+@app.post("/api/ons/chat")
+def api_ons_chat(corpo: PerguntaIn) -> dict:
+    turnos = [{"pergunta": item.pergunta, "resposta": item.resposta} for item in corpo.historico]
+    try:
+        return responder_ons(corpo.pergunta, historico=turnos)
+    except ErroOns as erro:
+        raise HTTPException(status_code=502, detail=str(erro)) from erro
+    except (RuntimeError, ValueError) as erro:
         raise HTTPException(status_code=400, detail=str(erro)) from erro
 
 
@@ -130,25 +268,58 @@ def api_avaliacao() -> dict:
     return avaliacao.estado(DATA_DIR)
 
 
+@app.get("/api/avaliacao/progresso")
+def api_progresso() -> dict:
+    return {"progresso": avaliacao.ler_progresso()}
+
+
 @app.post("/api/avaliacao/gabarito")
-async def api_gabarito(arquivo: UploadFile = File(...)) -> dict:
-    conteudo = await arquivo.read()
+def api_gabarito(arquivo: UploadFile = File(...)) -> dict:
+    conteudo = arquivo.file.read(5 * 1024 * 1024 + 1)
     if len(conteudo) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Gabarito acima de 5 MB.")
     try:
-        avaliacao.importar(DATA_DIR, conteudo)
+        resultado = avaliacao.importar(DATA_DIR, conteudo)
     except (ValueError, UnicodeDecodeError) as erro:
         raise HTTPException(status_code=400, detail=str(erro)) from erro
-    return avaliacao.estado(DATA_DIR)
+    resultado.pop("itens")
+    return {**avaliacao.estado(DATA_DIR), "importacao": resultado}
 
 
 @app.post("/api/avaliacao/rodar")
-def api_rodar() -> dict:
+def api_rodar(corpo: RodarIn | None = None) -> dict:
+    corpo = corpo or RodarIn()
     try:
-        avaliacao.iniciar(DATA_DIR, ACERVO_DIR)
+        avaliacao.iniciar(DATA_DIR, ACERVO_DIR, modo=corpo.modo, reranker=corpo.reranker)
     except ValueError as erro:
         raise HTTPException(status_code=409, detail=str(erro)) from erro
     return avaliacao.estado(DATA_DIR)
+
+
+@app.get("/api/avaliacao/revisao")
+def api_revisao() -> dict:
+    return avaliacao.revisao(DATA_DIR)
+
+
+@app.put("/api/avaliacao/revisao")
+def api_revisar(corpo: RevisaoIn) -> dict:
+    try:
+        return avaliacao.revisar(DATA_DIR, corpo.id, corpo.veredito, corpo.resposta_corrigida, corpo.observacao)
+    except FileNotFoundError as erro:
+        raise HTTPException(status_code=404, detail=str(erro)) from erro
+    except ValueError as erro:
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+
+
+@app.delete("/api/avaliacao/revisao/{identificador}")
+def api_desfazer_revisao(identificador: str) -> dict:
+    return avaliacao.desfazer_revisao(DATA_DIR, identificador)
+
+
+@app.post("/api/retorno")
+def api_retorno(corpo: RetornoIn) -> dict:
+    registrar_retorno(DATA_DIR, corpo.consulta, corpo.util, corpo.comentario)
+    return {"ok": True}
 
 
 @app.get("/api/avaliacao/rodadas/{identificador}")

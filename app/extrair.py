@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
+
+from app.arquivos import ler_json
 
 EXTENSOES = {".pdf", ".docx", ".txt", ".md"}
 
 _CODIGO = re.compile(r"(?im)^c[oó]digo\s*:\s*(.+?)\s*$")
 _REVISAO = re.compile(r"(?im)^revis[aã]o\s*:\s*(.+?)\s*$")
 _STATUS = re.compile(r"(?im)^status\s*:\s*(.+?)\s*$")
-_TITULO = re.compile(r"(?m)^#\s+(.+?)\s*$")
+_TITULO = re.compile(r"(?m)^#\s+(?!\d)(.+?)\s*$")
 _STATUS_INATIVO = {
     "substituido",
     "substituído",
@@ -25,6 +26,7 @@ _STATUS_INATIVO = {
 
 _FIGURA = re.compile(r"(quadro|tabela|figura)\s+a\s+seguir", re.IGNORECASE)
 _LOGOTIPO_MINIMO = 3
+_PAGINA_SEM_TEXTO = 40
 
 
 @dataclass
@@ -34,6 +36,7 @@ class Figura:
     hash: str
     dados: bytes
     tipo: str
+    sem_texto: bool = False
 
 
 @dataclass
@@ -105,7 +108,13 @@ def figuras_de_conteudo(caminho: Path) -> list[Figura]:
 
     leitor = PdfReader(str(caminho))
     brutas: list[tuple[int, str, bytes, str]] = []
+    sem_texto: set[int] = set()
     for numero, pagina in enumerate(leitor.pages, start=1):
+        try:
+            if len((pagina.extract_text() or "").strip()) < _PAGINA_SEM_TEXTO:
+                sem_texto.add(numero)
+        except Exception:
+            pass
         for imagem in pagina.images:
             dados = bytes(imagem.data or b"")
             if not dados:
@@ -116,7 +125,7 @@ def figuras_de_conteudo(caminho: Path) -> list[Figura]:
     for _, resumo, _, _ in brutas:
         contagem[resumo] = contagem.get(resumo, 0) + 1
     return [
-        Figura(caminho.name, numero, resumo, dados, tipo)
+        Figura(caminho.name, numero, resumo, dados, tipo, numero in sem_texto)
         for numero, resumo, dados, tipo in brutas
         if contagem[resumo] < _LOGOTIPO_MINIMO
     ]
@@ -187,28 +196,74 @@ def _compactar_layout(texto: str) -> str:
 
 def _ler_docx(caminho: Path) -> list[tuple[int, str]]:
     import docx
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
 
     documento = docx.Document(str(caminho))
     partes: list[str] = []
-    for paragrafo in documento.paragraphs:
+    contadores = [0] * 9
+    for filho in documento.element.body.iterchildren():
+        if filho.tag == qn("w:tbl"):
+            partes.extend(_linhas_tabela(Table(filho, documento)))
+            continue
+        if filho.tag != qn("w:p"):
+            continue
+        paragrafo = Paragraph(filho, documento)
         texto = paragrafo.text.strip()
         if not texto:
             continue
         estilo = paragrafo.style.name if paragrafo.style is not None else ""
-        if estilo.lower().startswith("heading"):
-            digitos = re.findall(r"\d+", estilo)
-            nivel = min(int(digitos[0]), 6) if digitos else 1
-            partes.append(f"{'#' * nivel} {texto}")
-        else:
+        if _ESTILO_SUMARIO.match(estilo):
+            continue
+        titulo = _ESTILO_TITULO.match(estilo)
+        if not titulo:
             partes.append(texto)
+            continue
+        nivel = min(int(titulo.group(2)), 6)
+        if _numerado(paragrafo) and not texto[:1].isdigit():
+            contadores[nivel - 1] += 1
+            contadores[nivel:] = [0] * (len(contadores) - nivel)
+            texto = ".".join(str(contador) for contador in contadores[:nivel]) + " " + texto
+        partes.append(f"{'#' * nivel} {texto}")
     return [(1, "\n\n".join(partes))]
+
+
+_ESTILO_TITULO = re.compile(r"^(heading|t[ií]tulo)\s*(\d)", re.IGNORECASE)
+_ESTILO_SUMARIO = re.compile(r"^(toc|sum[aá]rio|[ií]ndice)\b", re.IGNORECASE)
+
+
+def _numerado(paragrafo) -> bool:
+    propriedades = paragrafo._p.pPr
+    if propriedades is not None and propriedades.numPr is not None:
+        return True
+    estilo = paragrafo.style
+    while estilo is not None:
+        propriedades = estilo.element.pPr
+        if propriedades is not None and propriedades.numPr is not None:
+            return True
+        estilo = estilo.base_style
+    return False
+
+
+def _linhas_tabela(tabela) -> list[str]:
+    linhas: list[str] = []
+    for linha in tabela.rows:
+        celulas: list[str] = []
+        for celula in linha.cells:
+            texto = " ".join(celula.text.split())
+            if texto and (not celulas or celulas[-1] != texto):
+                celulas.append(texto)
+        if celulas:
+            linhas.append(" | ".join(celulas))
+    return linhas
 
 
 def _metadados(caminho: Path, texto: str) -> dict[str, str | bool]:
     lateral = caminho.parent / f"{caminho.name}.meta.json"
-    dados: dict = {}
-    if lateral.exists():
-        dados = json.loads(lateral.read_text(encoding="utf-8-sig"))
+    dados = ler_json(lateral, {}, "utf-8-sig") if lateral.exists() else {}
+    if not isinstance(dados, dict):
+        dados = {}
     codigo = str(dados.get("codigo") or _grupo(_CODIGO, texto) or caminho.stem).strip()
     revisao = str(dados.get("revisao") or _grupo(_REVISAO, texto) or "").strip()
     titulo = str(dados.get("titulo") or _grupo(_TITULO, texto) or caminho.stem).strip()
