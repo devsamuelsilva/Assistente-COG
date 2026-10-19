@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { carregarAcervo } from "./api"
+import { carregarAcervo, carregarInicio } from "./api"
 import Acervo from "./Acervo"
 import Avaliacao from "./Avaliacao"
 import { BarraGlobal } from "./Carregando"
@@ -15,25 +15,37 @@ const TELAS = [
 ]
 
 export default function App() {
-  const [tela, setTela] = useState("acervo")
+  const [escolhida, setTela] = useState("chat")
+  const [inicio, setInicio] = useState(null)
   const [estado, setEstado] = useState(null)
   const [erro, setErro] = useState("")
+  const [hash, setHash] = useState(() => window.location.hash)
   const tema = useTema()
+  const administracao = Boolean(inicio?.administracao) && hash === "#admin"
+  const tela = administracao ? escolhida : "chat"
+
+  useEffect(() => {
+    const trocar = () => setHash(window.location.hash)
+    window.addEventListener("hashchange", trocar)
+    return () => window.removeEventListener("hashchange", trocar)
+  }, [])
 
   const atualizar = useCallback(async () => {
     try {
-      setEstado(await carregarAcervo())
+      const dados = await carregarInicio()
+      setInicio(dados)
+      if (dados.administracao && hash === "#admin") setEstado(await carregarAcervo())
       setErro("")
     } catch (falha) {
       setErro(falha.message)
     }
-  }, [])
+  }, [hash])
 
   useEffect(() => {
     atualizar()
   }, [atualizar])
 
-  const indice = estado?.indice
+  const indice = estado?.indice ?? inicio?.indice
 
   return (
     <div className={tela === "chat" ? "pagina consulta" : "pagina"}>
@@ -47,14 +59,16 @@ export default function App() {
           </div>
         </div>
         <div className="navegacao">
-          <nav className="abas" aria-label="Ambientes">
-            {TELAS.map(([id, rotulo]) => (
-              <button key={id} type="button" className={tela === id ? "ativo" : ""} onClick={() => setTela(id)}>
-                {rotulo}
-                {id === "chat" && indice?.existe ? <span className="contagem">{indice.vigentes}</span> : null}
-              </button>
-            ))}
-          </nav>
+          {administracao ? (
+            <nav className="abas" aria-label="Ambientes">
+              {TELAS.map(([id, rotulo]) => (
+                <button key={id} type="button" className={tela === id ? "ativo" : ""} onClick={() => setTela(id)}>
+                  {rotulo}
+                  {id === "chat" && indice?.existe ? <span className="contagem">{indice.vigentes}</span> : null}
+                </button>
+              ))}
+            </nav>
+          ) : null}
           <button
             type="button"
             className="tema"
@@ -69,17 +83,17 @@ export default function App() {
 
       {erro ? <p className="aviso faixa">{erro}</p> : null}
 
-      {tela === "acervo" ? (
+      {administracao && tela === "acervo" ? (
         <Acervo estado={estado} onEstado={setEstado} onErro={setErro} />
       ) : null}
       <Chat
         ativo={tela === "chat"}
         indice={indice}
-        carregando={estado === null}
-        onIrAoAcervo={() => setTela("acervo")}
+        carregando={inicio === null}
+        onIrAoAcervo={administracao ? () => setTela("acervo") : null}
       />
-      {tela === "historico" ? <Historico /> : null}
-      {tela === "avaliacao" ? <Avaliacao /> : null}
+      {administracao && tela === "historico" ? <Historico /> : null}
+      {administracao && tela === "avaliacao" ? <Avaliacao /> : null}
     </div>
   )
 }

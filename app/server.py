@@ -24,6 +24,7 @@ from app.painel import (
     consultar,
     estado_acervo,
     estado_indexacao,
+    estado_indice,
     gravar_meta,
     iniciar_indexacao,
     remover_arquivo,
@@ -68,6 +69,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+_LOCAIS = {"127.0.0.1", "::1"}
+_ABERTAS_NA_REDE = {
+    ("GET", "/api/inicio"),
+    ("POST", "/api/chat"),
+    ("POST", "/api/ons/chat"),
+    ("POST", "/api/retorno"),
+    ("GET", "/api/uso/perguntas"),
+}
+
+
+def _local(request: Request) -> bool:
+    return request.client is not None and request.client.host in _LOCAIS
+
+
+@app.middleware("http")
+async def _so_chat_pela_rede(request: Request, call_next):
+    """Pela rede, só o chat. Acervo, treino, histórico e custo ficam para quem está neste PC."""
+    caminho = request.url.path
+    if caminho.startswith("/api/") and (request.method, caminho) not in _ABERTAS_NA_REDE and not _local(request):
+        return JSONResponse({"detail": "Disponível só no computador do assistente."}, status_code=403)
+    return await call_next(request)
 
 
 @app.exception_handler(OpenAIError)
@@ -125,6 +148,11 @@ class ArquivoIn(BaseModel):
 
 class RevisaoVisaoIn(BaseModel):
     texto: str | None = None
+
+
+@app.get("/api/inicio")
+def api_inicio(request: Request) -> dict:
+    return {"indice": estado_indice(), "administracao": _local(request)}
 
 
 @app.get("/api/acervo")

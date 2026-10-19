@@ -104,7 +104,7 @@ class EnvioTeste(unittest.TestCase):
                 patch.object(server, "iniciar_indexacao") as iniciar,
                 patch.object(server, "estado_acervo", return_value={"documentos": [], "indice": {}}),
             ):
-                cliente = TestClient(server.app)
+                cliente = TestClient(server.app, client=("127.0.0.1", 50000))
                 resposta = cliente.post("/api/acervo", files={"arquivo": ("it-novo.md", conteudo)})
                 self.assertEqual(resposta.status_code, 200)
                 self.assertEqual(resposta.json()["enviado"], "it-novo.md")
@@ -118,6 +118,28 @@ class EnvioTeste(unittest.TestCase):
                     )
                     gravar.assert_called_once()
                 iniciar.assert_called_once()
+
+
+class AcessoPelaRedeTeste(unittest.TestCase):
+    def test_pela_rede_so_o_chat_responde(self) -> None:
+        indice = {"existe": True, "desatualizado": False, "trechos": 3, "vigentes": 3}
+        with (
+            patch.object(server, "estado_indice", return_value=indice),
+            patch.object(server, "estado_acervo", return_value={"documentos": [], "indice": indice}),
+        ):
+            rede = TestClient(server.app, client=("10.85.11.70", 50000))
+            inicio = rede.get("/api/inicio")
+            self.assertEqual(inicio.status_code, 200)
+            self.assertEqual(inicio.json(), {"indice": indice, "administracao": False})
+            self.assertEqual(rede.get("/api/acervo").status_code, 403)
+            self.assertEqual(rede.request("DELETE", "/api/acervo", json={"arquivo": "a.pdf"}).status_code, 403)
+            self.assertEqual(rede.post("/api/indexar").status_code, 403)
+            self.assertEqual(rede.get("/api/uso").status_code, 403)
+            self.assertEqual(rede.post("/api/chat", json={"pergunta": ""}).status_code, 422)
+
+            local = TestClient(server.app, client=("127.0.0.1", 50000))
+            self.assertTrue(local.get("/api/inicio").json()["administracao"])
+            self.assertEqual(local.get("/api/acervo").status_code, 200)
 
 
 if __name__ == "__main__":
