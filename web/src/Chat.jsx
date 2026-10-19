@@ -361,7 +361,9 @@ function Bolha({ mensagem, onVotar }) {
           ))}
         </ul>
       ) : (
-        <p className="mudo">Siga o fluxo humano do COG.</p>
+        <p className="mudo">
+          {mensagem.status === "catalogo" ? "Lista montada a partir do acervo indexado." : "Siga o fluxo humano do COG."}
+        </p>
       )}
       {mensagem.status === "parcial" ? <p className="mudo">Para o que falta, siga o fluxo humano do COG.</p> : null}
       <p className="rodape-resposta">
