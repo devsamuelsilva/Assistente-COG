@@ -3,7 +3,9 @@
 tunnel: SUBSTITUA_PELO_ID_DO_TUNEL
 credentials-file: C:\Users\SEU_USUARIO\.cloudflared\SUBSTITUA_PELO_ID_DO_TUNEL.json
 
+# Só o webhook do Teams sai para a internet. Painel, chat, acervo e avaliação ficam no PC.
 ingress:
   - hostname: assistente-cog.seudominio.com
+    path: ^/teams/outgoing$
     service: http://127.0.0.1:8080
   - service: http_status:404

@@ -5,7 +5,9 @@ import hashlib
 import hmac
 import json
 import unittest
+from contextlib import nullcontext
 
+import httpx
 from fastapi.testclient import TestClient
 
 import app.server as servidor
@@ -21,7 +23,7 @@ class WebhookTeste(unittest.TestCase):
         servidor.TEAMS_OUTGOING_HMAC_SECRET = segredo
         servidor.processar_mencao = lambda pergunta, autor: chamadas.append((pergunta, autor))
         try:
-            with TestClient(servidor.app) as cliente:
+            with nullcontext(TestClient(servidor.app)) as cliente:
                 sem_assinatura = cliente.post("/teams/outgoing", json={"text": "qual o valor?"})
                 self.assertEqual(sem_assinatura.status_code, 401)
 
@@ -55,6 +57,40 @@ class WebhookTeste(unittest.TestCase):
             servidor.TEAMS_OUTGOING_HMAC_SECRET = original
             servidor.processar_mencao = processo
             servidor._ATIVIDADES.clear()
+
+    def test_falha_da_openai_vira_502(self) -> None:
+        from openai import APIConnectionError
+
+        def consultar(_pergunta: str, historico: list[dict]) -> dict:
+            raise APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"))
+
+        original = servidor.consultar
+        servidor.consultar = consultar
+        try:
+            with nullcontext(TestClient(servidor.app)) as cliente:
+                resposta = cliente.post("/api/chat", json={"pergunta": "qual o valor?"})
+            self.assertEqual(resposta.status_code, 502)
+            self.assertIn("APIConnectionError", resposta.json()["detail"])
+        finally:
+            servidor.consultar = original
+
+    def test_credito_esgotado_da_openai_diz_o_motivo(self) -> None:
+        from openai import RateLimitError
+
+        def consultar(_pergunta: str, historico: list[dict]) -> dict:
+            pedido = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+            corpo = {"message": "You have no credits remaining.", "type": "insufficient_quota", "code": "credit_balance_exhausted"}
+            raise RateLimitError("sem crédito", response=httpx.Response(429, request=pedido), body=corpo)
+
+        original = servidor.consultar
+        servidor.consultar = consultar
+        try:
+            with nullcontext(TestClient(servidor.app)) as cliente:
+                resposta = cliente.post("/api/chat", json={"pergunta": "qual o valor?"})
+            self.assertEqual(resposta.status_code, 502)
+            self.assertIn("créditos da conta da OpenAI acabaram", resposta.json()["detail"])
+        finally:
+            servidor.consultar = original
 
 
 if __name__ == "__main__":

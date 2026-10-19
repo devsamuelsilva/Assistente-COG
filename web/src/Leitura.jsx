@@ -9,7 +9,7 @@ export default function Leitura({ texto }) {
         parte.tipo === "lista" ? (
           <ul key={indice}>
             {parte.itens.map((item, posicao) => (
-              <li key={posicao}>
+              <li key={posicao} className={item.nivel ? "subitem" : ""}>
                 <span>{item.marca}</span>
                 <span>{item.texto}</span>
               </li>

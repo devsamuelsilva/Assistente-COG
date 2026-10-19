@@ -1,31 +1,82 @@
 const MARCA = "(?:[ivx]{2,4}|\\d{1,2}|[a-z])\\)"
 
+export const ROTULOS_STATUS = {
+  acerto: "Acerto",
+  parcial: "Parcial",
+  erro: "Erro",
+  recusa_indevida: "Recusa indevida",
+  invencao: "Invenção",
+  falha: "Falha técnica",
+}
+
+const ITEM = new RegExp(`^(?:(${MARCA})|(\\d{1,2}\\.)|([-•*–]))\\s+(\\S[\\s\\S]*)$`, "i")
+const PARAGRAFO_LONGO = 420
+const PARAGRAFO_ALVO = 300
+
+/**
+ * Divide um texto corrido em parágrafos de duas ou três frases. Só mexe em texto longo escrito numa linha só:
+ * quem já quebrou as linhas decidiu como quer o texto.
+ */
+function dividirParagrafoLongo(texto) {
+  if (texto.length <= PARAGRAFO_LONGO || texto.includes("\n")) return [texto]
+  const frases = texto.split(/(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ"(])/)
+  const paragrafos = []
+  let atual = ""
+  for (const frase of frases) {
+    atual = atual ? `${atual} ${frase}` : frase
+    if (atual.length >= PARAGRAFO_ALVO) {
+      paragrafos.push(atual)
+      atual = ""
+    }
+  }
+  if (atual) {
+    // sobra curta cola no parágrafo anterior, para não ficar uma frase solta no fim
+    if (paragrafos.length > 0 && atual.length < 100) paragrafos[paragrafos.length - 1] += ` ${atual}`
+    else paragrafos.push(atual)
+  }
+  return paragrafos
+}
+
+/**
+ * Transforma a resposta em blocos para a tela: parágrafos (separados por linha em branco) e listas
+ * (linhas com "- ", "•", "1." ou "a)"). Itens "a) … b) …" escritos na mesma linha também viram lista.
+ */
 export function blocosDeLeitura(texto) {
   const bruto = String(texto || "").replace(/\r\n/g, "\n").trim()
   if (!bruto) return []
   const linhas = bruto
     .replace(new RegExp(`[ \\t]+(?=${MARCA}\\s+\\S)`, "gi"), "\n")
     .split("\n")
-    .map((linha) => linha.trim())
-    .filter(Boolean)
+    .map((linha) => ({ recuo: linha.length - linha.trimStart().length, texto: linha.trim() }))
   const partes = []
   let lista = null
-  for (const linha of linhas) {
-    const item = linha.match(new RegExp(`^(${MARCA})\\s+([\\s\\S]+)$`, "i"))
+  let paragrafo = null
+  for (const { recuo, texto: linha } of linhas) {
+    if (!linha) {
+      lista = null
+      paragrafo = null
+      continue
+    }
+    const item = linha.match(ITEM)
     if (item) {
       if (!lista) {
         lista = []
         partes.push({ tipo: "lista", itens: lista })
       }
-      lista.push({ marca: item[1], texto: item[2] })
+      paragrafo = null
+      lista.push({ marca: item[1] || item[2] || "•", texto: item[4], nivel: recuo >= 2 ? 1 : 0 })
       continue
     }
     lista = null
-    const ultimo = partes[partes.length - 1]
-    if (ultimo?.tipo === "texto") ultimo.texto = `${ultimo.texto}\n${linha}`
-    else partes.push({ tipo: "texto", texto: linha })
+    if (paragrafo) paragrafo.texto = `${paragrafo.texto}\n${linha}`
+    else {
+      paragrafo = { tipo: "texto", texto: linha }
+      partes.push(paragrafo)
+    }
   }
-  return partes
+  return partes.flatMap((parte) =>
+    parte.tipo === "texto" ? dividirParagrafoLongo(parte.texto).map((texto) => ({ tipo: "texto", texto })) : [parte],
+  )
 }
 
 export function dolares(valor) {
@@ -35,6 +86,35 @@ export function dolares(valor) {
     minimumFractionDigits: 4,
     maximumFractionDigits: 6,
   })
+}
+
+const ETAPAS = {
+  indexando: ["Indexando o acervo", ""],
+  "lendo os documentos": ["Lendo os documentos", "documentos"],
+  "transcrevendo quadros": ["Transcrevendo quadros e figuras", "figuras"],
+  "visão geral": ["Gerando a visão geral", "documentos"],
+  "perguntas de busca": ["Gerando as perguntas de busca", "trechos"],
+  vetores: ["Calculando os vetores de busca", "trechos"],
+  "perguntas de treino": ["Treinando os documentos", "documentos"],
+  "reindexando com as perguntas aprendidas": ["Reindexando com as perguntas aprendidas", ""],
+  "conferindo com paráfrases": ["Conferindo com paráfrases", "documentos"],
+  "amostra com resposta completa": ["Conferindo uma amostra de respostas", "documentos"],
+}
+
+export function descricaoEtapa(situacao) {
+  if (!situacao?.etapa) return "Começando…"
+  const [rotulo, unidade] = ETAPAS[situacao.etapa] || [situacao.etapa, ""]
+  const contagem = situacao.total && unidade ? ` (${situacao.feitos} de ${situacao.total} ${unidade})` : ""
+  return `${rotulo}${contagem}`
+}
+
+export function custoDaConsulta(consulta) {
+  if (consulta.cache) return { texto: "Do cache · sem custo", cobrada: false }
+  if (consulta.custo_usd === null || consulta.custo_usd === undefined) {
+    return { texto: "Sem preço na tabela", cobrada: false }
+  }
+  const tokens = `${consulta.tokens_prompt.toLocaleString("pt-BR")} de entrada, ${consulta.tokens_resposta.toLocaleString("pt-BR")} de saída`
+  return { texto: `${dolares(consulta.custo_usd)} · ${tokens}`, cobrada: true }
 }
 
 export function numero(valor) {
@@ -84,34 +164,4 @@ export function agruparPorDocumento(consultas) {
     }
   }
   return [...grupos.values()]
-}
-
-export function serieDiaria(consultas) {
-  const mapa = new Map()
-  for (const consulta of [...consultas].reverse()) {
-    const dia = (consulta.quando || "").slice(0, 10) || "sem data"
-    const atual = mapa.get(dia) || { dia, custo: 0, cobradas: 0, cache: 0 }
-    if (consulta.cache) atual.cache += 1
-    else if (consulta.custo_usd != null) {
-      atual.cobradas += 1
-      atual.custo += consulta.custo_usd
-    }
-    mapa.set(dia, atual)
-  }
-  return [...mapa.values()]
-}
-
-export function custoPorDocumento(consultas) {
-  const mapa = new Map()
-  for (const consulta of consultas) {
-    const custo = consulta.custo_usd || 0
-    const documentos = documentosDaConsulta(consulta)
-    const parte = custo / documentos.length
-    for (const documento of documentos) {
-      mapa.set(documento.codigo, (mapa.get(documento.codigo) || 0) + parte)
-    }
-  }
-  return [...mapa.entries()]
-    .map(([codigo, custo]) => ({ codigo, custo }))
-    .sort((a, b) => b.custo - a.custo)
 }

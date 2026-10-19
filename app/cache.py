@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
+
+from app.arquivos import gravar_json, ler_json
 
 
 def chave(pergunta: str, fingerprint: str, conversa: str = "") -> str:
@@ -12,14 +13,9 @@ def chave(pergunta: str, fingerprint: str, conversa: str = "") -> str:
 
 
 def ler(data_dir: Path, identificador: str) -> dict | None:
-    arquivo = data_dir / "cache" / f"{identificador}.json"
-    if not arquivo.exists():
-        return None
-    return json.loads(arquivo.read_text(encoding="utf-8"))
+    guardado = ler_json(data_dir / "cache" / f"{identificador}.json")
+    return guardado if isinstance(guardado, dict) else None
 
 
 def gravar(data_dir: Path, identificador: str, payload: dict) -> None:
-    pasta = data_dir / "cache"
-    pasta.mkdir(parents=True, exist_ok=True)
-    destino = pasta / f"{identificador}.json"
-    destino.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    gravar_json(data_dir / "cache" / f"{identificador}.json", payload)
