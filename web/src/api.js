@@ -15,6 +15,10 @@ async function pedir(caminho, opcoes) {
   return corpo
 }
 
+export function carregarInicio() {
+  return api("/api/inicio", {}, null)
+}
+
 export function carregarAcervo() {
   return api("/api/acervo", {}, "Lendo o acervo…")
 }

@@ -416,6 +416,10 @@ def _avisos_quebra(trechos) -> list[str]:
     return avisos
 
 
+def estado_indice(acervo: Path | None = None, data_dir: Path | None = None) -> dict:
+    return _indice(acervo or ACERVO_DIR, data_dir or DATA_DIR)
+
+
 def _indice(acervo: Path, data_dir: Path) -> dict:
     arquivo = caminho_indice(data_dir) / "trechos.json"
     try:

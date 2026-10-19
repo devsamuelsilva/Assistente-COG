@@ -197,13 +197,19 @@ function Canal({ tipo, ativo, indice, semIndice = false, onIrAoAcervo }) {
         {semIndice ? (
           <p className="aviso faixa">
             Sem índice, a consulta não responde.{" "}
-            <button type="button" className="link" onClick={onIrAoAcervo}>
-              Abra o Acervo e indexe
-            </button>
-            .
+            {onIrAoAcervo ? (
+              <>
+                <button type="button" className="link" onClick={onIrAoAcervo}>
+                  Abra o Acervo e indexe
+                </button>
+                .
+              </>
+            ) : (
+              "Avise o responsável pelo assistente."
+            )}
           </p>
         ) : null}
-        {indice?.desatualizado && indice.existe ? (
+        {indice?.desatualizado && indice.existe && onIrAoAcervo ? (
           <p className="aviso faixa">O acervo mudou. Indexe de novo para a consulta usar a revisão atual.</p>
         ) : null}
 
